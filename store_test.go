@@ -14,6 +14,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// getTestDSN returns the test database DSN from the environment.
+// Shared by both integration tests and benchmarks.
+func getTestDSN() string {
+	return os.Getenv("TEST_DATABASE_URL")
+}
+
 // testDB returns a pgxpool connected to the test database.
 // Set TEST_DATABASE_URL to a Postgres connection string.
 // Tests are skipped if the env var is not set.

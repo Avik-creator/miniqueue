@@ -49,6 +49,16 @@ type WorkerConfig struct {
 	// Set to a custom function to control retry timing.
 	Backoff BackoffFunc
 
+	// Notifier is an optional LISTEN/NOTIFY-based notifier that wakes
+	// the worker immediately when a job is enqueued, instead of waiting
+	// for the next poll interval. This reduces worst-case latency from
+	// PollInterval (default 1s) to sub-millisecond.
+	//
+	// If nil, the worker uses pure polling (PollInterval).
+	// If set, the worker uses a hybrid approach: wake on notification
+	// OR on poll interval, whichever comes first.
+	Notifier *Notifier
+
 	// Logger for operational messages. Default: slog.Default().
 	Logger *slog.Logger
 }
@@ -239,9 +249,21 @@ func (w *Worker) heartbeat(ctx context.Context, cancel context.CancelFunc, jobID
 }
 
 // waitOrDone waits for the given duration or until ctx is cancelled.
+// If a Notifier is configured, it also wakes on notification.
 func (w *Worker) waitOrDone(ctx context.Context, d time.Duration) {
-	select {
-	case <-ctx.Done():
-	case <-time.After(d):
+	if w.config.Notifier != nil {
+		// Hybrid wait: wake on notification, poll interval, or shutdown.
+		wake := w.config.Notifier.WaitForWake(ctx)
+		select {
+		case <-ctx.Done():
+		case <-wake:
+		case <-time.After(d):
+		}
+	} else {
+		// Pure polling fallback.
+		select {
+		case <-ctx.Done():
+		case <-time.After(d):
+		}
 	}
 }
