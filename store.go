@@ -41,11 +41,16 @@ func NewStore(pool *pgxpool.Pool) *Store {
 // mechanism that makes at-least-once delivery safe: even if a producer
 // retries an enqueue (e.g., after a network timeout), the job is only
 // stored once.
-//
-// SQL: INSERT ... ON CONFLICT (idempotency_key) DO NOTHING + re-fetch.
 func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (*Job, error) {
+	job, _, err := s.EnqueueWithResult(ctx, opts)
+	return job, err
+}
+
+// EnqueueWithResult inserts a new job into the queue and reports whether it
+// created a new row or reused an existing idempotent job.
+func (s *Store) EnqueueWithResult(ctx context.Context, opts EnqueueOptions) (*Job, bool, error) {
 	if opts.Queue == "" {
-		return nil, errors.New("miniqueue: queue name is required")
+		return nil, false, errors.New("miniqueue: queue name is required")
 	}
 	if opts.Payload == nil {
 		opts.Payload = json.RawMessage("{}")
@@ -67,7 +72,7 @@ func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (*Job, error) 
 
 // enqueueIdempotent inserts with ON CONFLICT DO NOTHING and returns
 // the existing job on conflict.
-func (s *Store) enqueueIdempotent(ctx context.Context, opts EnqueueOptions, scheduledAt time.Time) (*Job, error) {
+func (s *Store) enqueueIdempotent(ctx context.Context, opts EnqueueOptions, scheduledAt time.Time) (*Job, bool, error) {
 	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO miniqueue_jobs (queue, idempotency_key, payload, priority, max_attempts, scheduled_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -76,16 +81,21 @@ func (s *Store) enqueueIdempotent(ctx context.Context, opts EnqueueOptions, sche
 		opts.Priority, opts.MaxAttempts, scheduledAt,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("miniqueue: enqueue: %w", err)
+		return nil, false, fmt.Errorf("miniqueue: enqueue: %w", err)
 	}
-	_ = tag // RowsAffected tells us if it was a new insert or conflict
+
+	wasNew := tag.RowsAffected() == 1
 
 	// Whether it was inserted or conflicted, fetch by key.
-	return s.fetchByIdempotencyKey(ctx, *opts.IdempotencyKey)
+	job, err := s.fetchByIdempotencyKey(ctx, *opts.IdempotencyKey)
+	if err != nil {
+		return nil, false, err
+	}
+	return job, wasNew, nil
 }
 
 // enqueueSimple inserts a job without an idempotency key.
-func (s *Store) enqueueSimple(ctx context.Context, opts EnqueueOptions, scheduledAt time.Time) (*Job, error) {
+func (s *Store) enqueueSimple(ctx context.Context, opts EnqueueOptions, scheduledAt time.Time) (*Job, bool, error) {
 	var job Job
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO miniqueue_jobs (queue, payload, priority, max_attempts, scheduled_at)
@@ -101,9 +111,9 @@ func (s *Store) enqueueSimple(ctx context.Context, opts EnqueueOptions, schedule
 		&job.CompletedAt,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("miniqueue: enqueue: %w", err)
+		return nil, false, fmt.Errorf("miniqueue: enqueue: %w", err)
 	}
-	return &job, nil
+	return &job, true, nil
 }
 
 // fetchByIdempotencyKey retrieves a job by its idempotency key.
@@ -214,9 +224,8 @@ func (s *Store) Complete(ctx context.Context, jobID int64, workerID string) erro
 }
 
 // Fail marks a job as failed with the given error message.
-// The job transitions to 'failed' — retry logic (Phase 3) will
-// handle re-scheduling with exponential backoff.
-// Only the worker holding the current lease can fail a job.
+// The job transitions to 'failed' and can be requeued manually if it should
+// be retried later. Only the worker holding the current lease can fail a job.
 func (s *Store) Fail(ctx context.Context, jobID int64, workerID string, errMsg string) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE miniqueue_jobs
@@ -376,11 +385,12 @@ func (s *Store) RecordFailure(ctx context.Context, jobID int64, workerID string,
 	return tx.Commit(ctx)
 }
 
-// Requeue manually moves a dead-letter job back to the available state.
+// Requeue manually moves a failed or dead-letter job back to the available state.
 // This is used to retry jobs that were permanently failed but can now be retried
 // (e.g., after fixing a bug or restoring a dependency).
 //
-// Only jobs in the 'dead' state can be requeued. The scheduled_at is reset to now().
+// Jobs in either the 'failed' or 'dead' state can be requeued. The scheduled_at
+// is reset to now().
 func (s *Store) Requeue(ctx context.Context, jobID int64) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE miniqueue_jobs
@@ -389,7 +399,7 @@ func (s *Store) Requeue(ctx context.Context, jobID int64) error {
 		    lease_expires_at = NULL,
 		    leased_by = NULL
 		WHERE id = $1
-		  AND state = 'dead'`,
+		  AND state IN ('failed', 'dead')`,
 		jobID,
 	)
 	if err != nil {
@@ -405,7 +415,7 @@ func (s *Store) Requeue(ctx context.Context, jobID int64) error {
 			}
 			return fmt.Errorf("miniqueue: requeue diagnose: %w", err)
 		}
-		return fmt.Errorf("miniqueue: cannot requeue job %d in state %q (must be 'dead')", jobID, state)
+		return fmt.Errorf("miniqueue: cannot requeue job %d in state %q (must be 'failed' or 'dead')", jobID, state)
 	}
 	return nil
 }

@@ -6,14 +6,17 @@ import "context"
 // It mirrors the shape of http.Handler — familiar, composable, and testable.
 //
 // Return nil to mark the job as completed.
-// Return an error to mark the job as failed (it will be retried in Phase 3).
+// Return an error to mark the job as failed. The worker records the error,
+// then either retries the job later or dead-letters it when its attempt budget
+// is exhausted.
 //
 // The context is cancelled when:
 //   - The lease is lost (another worker or the reaper reclaimed the job)
 //   - The worker is shutting down
 //
-// Handlers should check ctx.Done() periodically and return promptly
-// when cancelled to avoid doing work on a job that's no longer theirs.
+// Cancellation is cooperative, not forceful. Handlers should check ctx.Done()
+// periodically and return promptly when cancelled, but a handler that ignores
+// cancellation may continue running until it finishes on its own.
 type Handler interface {
 	HandleJob(ctx context.Context, job *Job) error
 }

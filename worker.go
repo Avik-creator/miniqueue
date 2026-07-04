@@ -184,6 +184,10 @@ loop:
 
 // processJob runs the handler with a heartbeat and records the outcome.
 // It releases the semaphore slot and decrements the WaitGroup on return.
+//
+// Note that cancellation is cooperative: the job context is cancelled when the
+// lease is lost or the worker is shutting down, but a handler that ignores
+// ctx.Done() can still continue running until it returns.
 func (w *Worker) processJob(parentCtx context.Context, wg *sync.WaitGroup, job *Job, sem chan struct{}) {
 	defer wg.Done()
 	defer func() { <-sem }() // release processing slot

@@ -89,14 +89,20 @@ func TestEnqueue_IdempotencyKey_NoDuplicates(t *testing.T) {
 		IdempotencyKey: &key,
 	}
 
-	job1, err := store.Enqueue(ctx, opts)
+	job1, wasNew1, err := store.EnqueueWithResult(ctx, opts)
 	if err != nil {
 		t.Fatalf("first enqueue failed: %v", err)
 	}
+	if !wasNew1 {
+		t.Fatal("expected first enqueue to create a new job")
+	}
 
-	job2, err := store.Enqueue(ctx, opts)
+	job2, wasNew2, err := store.EnqueueWithResult(ctx, opts)
 	if err != nil {
 		t.Fatalf("second enqueue failed: %v", err)
+	}
+	if wasNew2 {
+		t.Fatal("expected second enqueue to return the existing job")
 	}
 
 	if job1.ID != job2.ID {
@@ -534,6 +540,50 @@ func TestRecordFailure_DeadLetter(t *testing.T) {
 	}
 	if attempt != 2 {
 		t.Errorf("expected attempt 2, got %d", attempt)
+	}
+}
+
+func TestRequeue_FailedJob(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+
+	job, err := store.Enqueue(ctx, EnqueueOptions{
+		Queue:   "requeue-failed-test",
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	claimed, err := store.Claim(ctx, "requeue-failed-test", "worker-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	if err := store.Fail(ctx, claimed.ID, "worker-1", "temporary error"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	if err := store.Requeue(ctx, job.ID); err != nil {
+		t.Fatalf("requeue failed: %v", err)
+	}
+
+	var state State
+	err = pool.QueryRow(ctx, "SELECT state FROM miniqueue_jobs WHERE id = $1", job.ID).Scan(&state)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if state != StateAvailable {
+		t.Fatalf("expected available after requeue, got %q", state)
+	}
+
+	reclaimed, err := store.Claim(ctx, "requeue-failed-test", "worker-2", 30*time.Second)
+	if err != nil {
+		t.Fatalf("reclaim after requeue: %v", err)
+	}
+	if reclaimed.ID != job.ID {
+		t.Fatalf("reclaimed wrong job: want %d, got %d", job.ID, reclaimed.ID)
 	}
 }
 

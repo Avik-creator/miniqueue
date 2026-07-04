@@ -164,6 +164,8 @@ t=35.5s  Another worker claims the job as attempt=2.
 
 **Worst-case recovery time = LeaseDuration + ReaperInterval** (default: 35 seconds).
 
+Lease loss and shutdown are cooperative cancellations. A handler that ignores `ctx.Done()` may continue running until it returns, so handlers should be safe for retries and, when necessary, for concurrent execution if a lease is lost unexpectedly.
+
 ### Retry & Dead-Letter (`retry.go`, `store.go`)
 
 Failed jobs follow this lifecycle:
@@ -181,8 +183,10 @@ Handler returns error
         │
         └── attempt >= max_attempts
                 state → 'dead'
-                Manual Requeue() needed to retry
+                Manual Requeue() can move it back to 'available'
 ```
+
+A direct `Fail()` call transitions a job to `failed` and it can also be recovered with `Requeue()`.
 
 The backoff uses **exponential delay with full jitter** (from the [AWS Architecture Blog, 2015](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)):
 
