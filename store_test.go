@@ -430,3 +430,176 @@ func TestConcurrentClaim_SKIPLOCKED(t *testing.T) {
 		t.Errorf("expected %d claims, got %d", numJobs, totalClaimed.Load())
 	}
 }
+
+func TestRecordFailure_Retry(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+
+	job, err := store.Enqueue(ctx, EnqueueOptions{
+		Queue:       "retry-test",
+		Payload:     json.RawMessage(`{}`),
+		MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	claimed, err := store.Claim(ctx, "retry-test", "worker-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Record failure — should go back to available with future scheduled_at
+	fixedBackoff := func(attempt int) time.Duration { return 2 * time.Second }
+	err = store.RecordFailure(ctx, claimed.ID, "worker-1", "transient error", fixedBackoff)
+	if err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+
+	// Verify state
+	var state State
+	var scheduledAt time.Time
+	var lastError *string
+	err = pool.QueryRow(ctx,
+		"SELECT state, scheduled_at, last_error FROM miniqueue_jobs WHERE id = $1", job.ID,
+	).Scan(&state, &scheduledAt, &lastError)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+
+	if state != StateAvailable {
+		t.Errorf("expected state 'available', got %q", state)
+	}
+	if lastError == nil || *lastError != "transient error" {
+		t.Errorf("expected last_error 'transient error', got %v", lastError)
+	}
+	// scheduled_at should be ~2s in the future
+	if scheduledAt.Before(time.Now().Add(1 * time.Second)) {
+		t.Errorf("expected scheduled_at ~2s in future, got %v", scheduledAt)
+	}
+}
+
+func TestRecordFailure_DeadLetter(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+
+	// Enqueue with max_attempts = 2
+	job, err := store.Enqueue(ctx, EnqueueOptions{
+		Queue:       "dead-test",
+		Payload:     json.RawMessage(`{}`),
+		MaxAttempts: 2,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Claim and fail twice to exhaust max_attempts
+	for i := 0; i < 2; i++ {
+		// Small sleep to ensure scheduled_at (set by Go's clock) is
+		// in the past relative to Postgres's now() on the next claim.
+		time.Sleep(50 * time.Millisecond)
+
+		claimed, err := store.Claim(ctx, "dead-test", "worker-1", 30*time.Second)
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+
+		// Use zero backoff so the job is immediately claimable again
+		err = store.RecordFailure(ctx, claimed.ID, "worker-1", "permanent error", func(int) time.Duration { return 0 })
+		if err != nil {
+			t.Fatalf("record failure %d: %v", i, err)
+		}
+	}
+
+	// After 2 attempts, job should be dead
+	var state State
+	var attempt int
+	err = pool.QueryRow(ctx,
+		"SELECT state, attempt FROM miniqueue_jobs WHERE id = $1", job.ID,
+	).Scan(&state, &attempt)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+
+	if state != StateDead {
+		t.Errorf("expected state 'dead', got %q", state)
+	}
+	if attempt != 2 {
+		t.Errorf("expected attempt 2, got %d", attempt)
+	}
+}
+
+func TestRequeue(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+
+	job, err := store.Enqueue(ctx, EnqueueOptions{
+		Queue:       "requeue-test",
+		Payload:     json.RawMessage(`{}`),
+		MaxAttempts: 1,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Claim and fail to get to dead state
+	claimed, err := store.Claim(ctx, "requeue-test", "worker-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	err = store.RecordFailure(ctx, claimed.ID, "worker-1", "fatal", func(int) time.Duration { return 0 })
+	if err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+
+	// Verify it's dead
+	var state State
+	_ = pool.QueryRow(ctx, "SELECT state FROM miniqueue_jobs WHERE id = $1", job.ID).Scan(&state)
+	if state != StateDead {
+		t.Fatalf("expected dead, got %q", state)
+	}
+
+	// Requeue it
+	err = store.Requeue(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+
+	// Verify it's available again
+	_ = pool.QueryRow(ctx, "SELECT state FROM miniqueue_jobs WHERE id = $1", job.ID).Scan(&state)
+	if state != StateAvailable {
+		t.Errorf("expected available after requeue, got %q", state)
+	}
+
+	// Should be claimable
+	reclaimed, err := store.Claim(ctx, "requeue-test", "worker-2", 30*time.Second)
+	if err != nil {
+		t.Fatalf("reclaim after requeue: %v", err)
+	}
+	if reclaimed.ID != job.ID {
+		t.Errorf("reclaimed wrong job: want %d, got %d", job.ID, reclaimed.ID)
+	}
+}
+
+func TestRequeue_NonDeadJob(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+
+	job, err := store.Enqueue(ctx, EnqueueOptions{
+		Queue:   "requeue-fail-test",
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Try to requeue an available (non-dead) job
+	err = store.Requeue(ctx, job.ID)
+	if err == nil {
+		t.Error("expected error requeuing non-dead job")
+	}
+}

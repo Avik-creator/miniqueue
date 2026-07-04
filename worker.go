@@ -44,6 +44,11 @@ type WorkerConfig struct {
 	// will recover them when their lease expires).
 	ShutdownTimeout time.Duration
 
+	// Backoff is the function that computes retry delays.
+	// Default: DefaultBackoff (exponential backoff with jitter).
+	// Set to a custom function to control retry timing.
+	Backoff BackoffFunc
+
 	// Logger for operational messages. Default: slog.Default().
 	Logger *slog.Logger
 }
@@ -74,6 +79,9 @@ func NewWorker(store *Store, handler Handler, config WorkerConfig) *Worker {
 	}
 	if config.ShutdownTimeout <= 0 {
 		config.ShutdownTimeout = 10 * time.Second
+	}
+	if config.Backoff == nil {
+		config.Backoff = DefaultBackoff
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -195,8 +203,8 @@ func (w *Worker) processJob(parentCtx context.Context, wg *sync.WaitGroup, job *
 	defer doneCancel()
 
 	if handlerErr != nil {
-		w.log.Info("job failed", "job_id", job.ID, "error", handlerErr)
-		if err := w.store.Fail(doneCtx, job.ID, w.config.WorkerID, handlerErr.Error()); err != nil {
+		w.log.Info("job failed", "job_id", job.ID, "attempt", job.Attempt, "error", handlerErr)
+		if err := w.store.RecordFailure(doneCtx, job.ID, w.config.WorkerID, handlerErr.Error(), w.config.Backoff); err != nil {
 			w.log.Error("failed to record job failure", "job_id", job.ID, "error", err)
 		}
 	} else {

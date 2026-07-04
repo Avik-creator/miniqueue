@@ -129,8 +129,9 @@ func TestWorker_FailedJobRecordsError(t *testing.T) {
 	defer cancel()
 
 	job, err := store.Enqueue(ctx, EnqueueOptions{
-		Queue:   "fail-test",
-		Payload: json.RawMessage(`{}`),
+		Queue:       "fail-test",
+		Payload:     json.RawMessage(`{}`),
+		MaxAttempts: 1, // Fail once → dead-letter
 	})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
@@ -152,14 +153,27 @@ func TestWorker_FailedJobRecordsError(t *testing.T) {
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- w.Start(ctx) }()
 
-	state := waitForJobCompleted(t, store, job.ID, 5*time.Second)
-	if state != StateFailed {
-		t.Errorf("expected failed, got %s", state)
+	// With max_attempts=1, the job goes to dead after one failure
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var state State
+		_ = pool.QueryRow(ctx, "SELECT state FROM miniqueue_jobs WHERE id=$1", job.ID).Scan(&state)
+		if state == StateDead {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
+	var state State
 	var lastError *string
-	if err := pool.QueryRow(ctx, "SELECT last_error FROM miniqueue_jobs WHERE id=$1", job.ID).Scan(&lastError); err != nil {
+	err = pool.QueryRow(ctx,
+		"SELECT state, last_error FROM miniqueue_jobs WHERE id=$1", job.ID,
+	).Scan(&state, &lastError)
+	if err != nil {
 		t.Fatalf("query: %v", err)
+	}
+	if state != StateDead {
+		t.Errorf("expected dead, got %s", state)
 	}
 	if lastError == nil || *lastError != "database connection refused" {
 		t.Errorf("wrong last_error: got %v", lastError)
@@ -445,4 +459,135 @@ func TestWorker_ConcurrentWorkers(t *testing.T) {
 	if dbCount != numJobs {
 		t.Errorf("expected %d completed in DB, got %d", numJobs, dbCount)
 	}
+}
+
+// TestWorker_RetryAndDeadLetter tests the full retry cycle:
+// job fails → retries with backoff → eventually dead-lettered after max_attempts.
+func TestWorker_RetryAndDeadLetter(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	job, err := store.Enqueue(ctx, EnqueueOptions{
+		Queue:       "retry-e2e",
+		Payload:     json.RawMessage(`{"task":"will_always_fail"}`),
+		MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Handler that always fails
+	var attemptCount atomic.Int64
+	handler := HandlerFunc(func(ctx context.Context, job *Job) error {
+		attemptCount.Add(1)
+		return errors.New("simulated failure")
+	})
+
+	// Use a very short backoff so the test runs quickly
+	zeroBackoff := func(attempt int) time.Duration { return 100 * time.Millisecond }
+
+	w := NewWorker(store, handler, WorkerConfig{
+		Queue:             "retry-e2e",
+		WorkerID:          "retry-worker",
+		PollInterval:      100 * time.Millisecond,
+		LeaseDuration:     10 * time.Second,
+		HeartbeatInterval: 3 * time.Second,
+		ShutdownTimeout:   5 * time.Second,
+		Backoff:           zeroBackoff,
+	})
+
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- w.Start(ctx) }()
+
+	// Wait for the job to be dead-lettered (after 3 attempts)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var state State
+		_ = pool.QueryRow(ctx, "SELECT state FROM miniqueue_jobs WHERE id=$1", job.ID).Scan(&state)
+		if state == StateDead {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Verify it's dead
+	var state State
+	var attempt int
+	var lastError *string
+	err = pool.QueryRow(ctx,
+		"SELECT state, attempt, last_error FROM miniqueue_jobs WHERE id=$1", job.ID,
+	).Scan(&state, &attempt, &lastError)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+
+	if state != StateDead {
+		t.Errorf("expected state 'dead', got %q", state)
+	}
+	if attempt != 3 {
+		t.Errorf("expected 3 attempts, got %d", attempt)
+	}
+	if lastError == nil || *lastError != "simulated failure" {
+		t.Errorf("expected last_error 'simulated failure', got %v", lastError)
+	}
+
+	cancel()
+	<-workerDone
+}
+
+// TestWorker_EventualSuccessAfterRetry tests that a job can succeed
+// after failing a few times (simulating transient failures).
+func TestWorker_EventualSuccessAfterRetry(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	job, err := store.Enqueue(ctx, EnqueueOptions{
+		Queue:       "eventual-success",
+		Payload:     json.RawMessage(`{}`),
+		MaxAttempts: 5,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Handler that fails twice then succeeds
+	var callCount atomic.Int64
+	handler := HandlerFunc(func(ctx context.Context, job *Job) error {
+		n := callCount.Add(1)
+		if n < 3 {
+			return fmt.Errorf("transient error #%d", n)
+		}
+		return nil // success on 3rd attempt
+	})
+
+	zeroBackoff := func(attempt int) time.Duration { return 100 * time.Millisecond }
+
+	w := NewWorker(store, handler, WorkerConfig{
+		Queue:             "eventual-success",
+		WorkerID:          "eventual-worker",
+		PollInterval:      100 * time.Millisecond,
+		LeaseDuration:     10 * time.Second,
+		HeartbeatInterval: 3 * time.Second,
+		ShutdownTimeout:   5 * time.Second,
+		Backoff:           zeroBackoff,
+	})
+
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- w.Start(ctx) }()
+
+	state := waitForJobCompleted(t, store, job.ID, 10*time.Second)
+	if state != StateCompleted {
+		t.Errorf("expected completed, got %s", state)
+	}
+
+	if callCount.Load() != 3 {
+		t.Errorf("expected 3 handler calls, got %d", callCount.Load())
+	}
+
+	cancel()
+	<-workerDone
 }

@@ -297,3 +297,115 @@ func (s *Store) diagnoseMissedUpdate(ctx context.Context, jobID int64, workerID 
 	}
 	return fmt.Errorf("%w: job %d is in state %q, leased by %v", ErrJobNotLeased, jobID, state, leasedBy)
 }
+
+// RecordFailure marks a job as failed and either schedules it for retry or
+// moves it to the dead-letter state based on the attempt count.
+//
+// If attempt < max_attempts:
+//   - State transitions to 'available'
+//   - scheduled_at is set to now() + backoff(attempt)
+//   - The job will be re-claimed after the backoff period
+//
+// If attempt >= max_attempts:
+//   - State transitions to 'dead'
+//   - The job is permanently failed and requires manual intervention
+//
+// The backoff function is called with the current attempt number (1-indexed).
+// Only the worker holding the current lease can record a failure.
+func (s *Store) RecordFailure(ctx context.Context, jobID int64, workerID string, errMsg string, backoff BackoffFunc) error {
+	// Start a transaction to ensure consistency
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("miniqueue: record failure begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Fetch the current job state
+	var job Job
+	err = tx.QueryRow(ctx, `
+		SELECT id, queue, idempotency_key, payload, state, priority,
+		       attempt, max_attempts, scheduled_at, lease_expires_at,
+		       leased_by, last_error, created_at, completed_at
+		FROM miniqueue_jobs
+		WHERE id = $1
+		  AND state = 'running'
+		  AND leased_by = $2
+		FOR UPDATE`, jobID, workerID,
+	).Scan(
+		&job.ID, &job.Queue, &job.IdempotencyKey, &job.Payload, &job.State,
+		&job.Priority, &job.Attempt, &job.MaxAttempts, &job.ScheduledAt,
+		&job.LeaseExpiresAt, &job.LeasedBy, &job.LastError, &job.CreatedAt,
+		&job.CompletedAt,
+	)
+	if err != nil {
+		tx.Rollback(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return s.diagnoseMissedUpdate(ctx, jobID, workerID)
+		}
+		return fmt.Errorf("miniqueue: record failure fetch: %w", err)
+	}
+
+	// Decide: retry or dead-letter?
+	var newState State
+	var scheduledAt time.Time
+	if job.Attempt >= job.MaxAttempts {
+		newState = StateDead
+		scheduledAt = job.ScheduledAt // keep original scheduled_at for dead jobs
+	} else {
+		newState = StateAvailable
+		backoffDuration := backoff(job.Attempt)
+		scheduledAt = time.Now().Add(backoffDuration)
+	}
+
+	// Update the job
+	_, err = tx.Exec(ctx, `
+		UPDATE miniqueue_jobs
+		SET state = $1,
+		    last_error = $2,
+		    scheduled_at = $3,
+		    lease_expires_at = NULL,
+		    leased_by = NULL
+		WHERE id = $4`,
+		newState, errMsg, scheduledAt, jobID,
+	)
+	if err != nil {
+		tx.Rollback(ctx)
+		return fmt.Errorf("miniqueue: record failure update: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// Requeue manually moves a dead-letter job back to the available state.
+// This is used to retry jobs that were permanently failed but can now be retried
+// (e.g., after fixing a bug or restoring a dependency).
+//
+// Only jobs in the 'dead' state can be requeued. The scheduled_at is reset to now().
+func (s *Store) Requeue(ctx context.Context, jobID int64) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE miniqueue_jobs
+		SET state = 'available',
+		    scheduled_at = now(),
+		    lease_expires_at = NULL,
+		    leased_by = NULL
+		WHERE id = $1
+		  AND state = 'dead'`,
+		jobID,
+	)
+	if err != nil {
+		return fmt.Errorf("miniqueue: requeue: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Check why it failed
+		var state State
+		err := s.pool.QueryRow(ctx, `SELECT state FROM miniqueue_jobs WHERE id = $1`, jobID).Scan(&state)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrJobNotFound
+			}
+			return fmt.Errorf("miniqueue: requeue diagnose: %w", err)
+		}
+		return fmt.Errorf("miniqueue: cannot requeue job %d in state %q (must be 'dead')", jobID, state)
+	}
+	return nil
+}
